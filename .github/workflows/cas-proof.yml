@@ -1,0 +1,310 @@
+name: Real Git-ref CAS proof (disposable repo)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lab/**"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/cas-proof.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Security and deterministic unit tests
+    if: github.repository == 'RamonRDR/SaaS-CAS-Lab' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate scope and budget model without credentials
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  bootstrap:
+    name: Create disposable Git ref
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      ref: ${{ steps.setup.outputs.ref }}
+      baseline: ${{ steps.setup.outputs.baseline }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: setup
+        name: Initialize one run-scoped ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m lab.probe bootstrap
+
+  claim_prepare:
+    name: Claim proposal / ${{ matrix.worker }}
+    needs: [bootstrap]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        worker: [alpha, beta]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Create an independent sibling commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKER: ${{ matrix.worker }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          BASE: ${{ needs.bootstrap.outputs.baseline }}
+        run: |
+          python3 -m lab.probe prepare --phase claim --worker "$WORKER" \
+            --ref "$REF" --parent "$BASE" --out "out/claim-proposal-$WORKER.json"
+      - name: Preserve candidate SHA and exact parent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claim-proposal-${{ matrix.worker }}
+          path: out/claim-proposal-${{ matrix.worker }}.json
+          retention-days: 7
+          if-no-files-found: error
+
+  claim_race:
+    name: Claim remote writer / ${{ matrix.worker }}
+    needs: [bootstrap, claim_prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        worker: [alpha, beta]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: claim-proposal-${{ matrix.worker }}
+          path: inbox
+      - name: Update shared ref with force false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKER: ${{ matrix.worker }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          BASE: ${{ needs.bootstrap.outputs.baseline }}
+        run: |
+          python3 -m lab.probe race --phase claim --worker "$WORKER" \
+            --ref "$REF" --parent "$BASE" \
+            --proposal "inbox/claim-proposal-$WORKER.json" \
+            --out "out/claim-result-$WORKER.json"
+      - name: Keep API response as audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claim-result-${{ matrix.worker }}
+          path: out/claim-result-${{ matrix.worker }}.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  claim_verify:
+    name: Verify exactly one remote claim winner
+    needs: [bootstrap, claim_race]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: read
+    outputs:
+      winner_sha: ${{ steps.verify.outputs.winner_sha }}
+      winner: ${{ steps.verify.outputs.winner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: claim-proposal-*
+          path: inbox/proposals
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: claim-result-*
+          path: inbox/results
+          merge-multiple: true
+      - id: verify
+        name: Check API statuses and persisted Git state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          BASE: ${{ needs.bootstrap.outputs.baseline }}
+        run: |
+          python3 -m lab.probe verify --phase claim --ref "$REF" \
+            --parent "$BASE" --proposals inbox/proposals --results inbox/results \
+            --out out/verified-claim.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-claim
+          path: out/verified-claim.json
+          retention-days: 7
+          if-no-files-found: error
+
+  budget_prepare:
+    name: Budget proposal / ${{ matrix.worker }}
+    needs: [bootstrap, claim_verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        worker: [alpha, beta]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Propose conflicting money reservations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKER: ${{ matrix.worker }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          PARENT_SHA: ${{ needs.claim_verify.outputs.winner_sha }}
+          CLAIM_OWNER: ${{ needs.claim_verify.outputs.winner }}
+        run: |
+          python3 -m lab.probe prepare --phase budget --worker "$WORKER" \
+            --ref "$REF" --parent "$PARENT_SHA" \
+            --out "out/budget-proposal-$WORKER.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: budget-proposal-${{ matrix.worker }}
+          path: out/budget-proposal-${{ matrix.worker }}.json
+          retention-days: 7
+          if-no-files-found: error
+
+  budget_race:
+    name: Budget remote writer / ${{ matrix.worker }}
+    needs: [bootstrap, claim_verify, budget_prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        worker: [alpha, beta]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: budget-proposal-${{ matrix.worker }}
+          path: inbox
+      - name: Race on same ledger Git ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKER: ${{ matrix.worker }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          PARENT_SHA: ${{ needs.claim_verify.outputs.winner_sha }}
+        run: |
+          python3 -m lab.probe race --phase budget --worker "$WORKER" \
+            --ref "$REF" --parent "$PARENT_SHA" \
+            --proposal "inbox/budget-proposal-$WORKER.json" \
+            --out "out/budget-result-$WORKER.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: budget-result-${{ matrix.worker }}
+          path: out/budget-result-${{ matrix.worker }}.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  budget_verify:
+    name: Verify one persisted financial reservation
+    needs: [bootstrap, claim_verify, budget_race]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: budget-proposal-*
+          path: inbox/proposals
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: budget-result-*
+          path: inbox/results
+          merge-multiple: true
+      - name: Check statuses, winner and remote money ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+          PARENT_SHA: ${{ needs.claim_verify.outputs.winner_sha }}
+        run: |
+          python3 -m lab.probe verify --phase budget --ref "$REF" \
+            --parent "$PARENT_SHA" --proposals inbox/proposals \
+            --results inbox/results --out out/verified-budget.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-budget
+          path: out/verified-budget.json
+          retention-days: 7
+          if-no-files-found: error
+
+  budget_reconcile:
+    name: Single-writer CAS reconciliation, budget and lost ACK
+    needs: [bootstrap, budget_verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Reconcile six operations against global 4-unit cap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.bootstrap.outputs.ref }}
+        run: python3 -m lab.probe reconcile --ref "$REF" --out out/final-budget.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final-budget
+          path: out/final-budget.json
+          retention-days: 7
+          if-no-files-found: error
+
+  cleanup:
+    name: Always delete and verify disposable Git ref
+    needs: [bootstrap, claim_prepare, claim_race, claim_verify, budget_prepare, budget_race, budget_verify, budget_reconcile]
+    if: always() && github.repository == 'RamonRDR/SaaS-CAS-Lab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Delete only this run's ref and verify absence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m lab.probe cleanup
