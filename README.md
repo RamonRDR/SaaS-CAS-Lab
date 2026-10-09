@@ -37,3 +37,7 @@ O workflow `.github/workflows/cas-proof.yml` executa apenas em `push` da `main` 
 ## Origem
 
 Os primeiros experimentos, arquitetura e análise de segurança permanecem em [SaaS-Project/experiments/claim_budget_lab](https://github.com/RamonRDR/SaaS-Project/tree/experiment/claim-budget-lab/experiments/claim_budget_lab).
+
+## Teste negativo adicional: fast-forward não é CAS semântico
+
+O job `stale_fast_forward` demonstra deliberadamente que uma atualização `PATCH /git/refs` com `force: false` pode aceitar um **commit descendente válido** mesmo quando o conteúdo do ledger foi calculado a partir de uma geração antiga. O teste registra a regressão observada, restaura as quatro reservas no ledger efêmero e só então permite a limpeza. O resultado deve ser interpretado como **evidência de limitação do mecanismo**, não como funcionalidade pronta.
